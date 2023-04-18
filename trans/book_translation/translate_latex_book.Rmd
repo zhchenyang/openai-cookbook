@@ -1,0 +1,122 @@
+---
+title: An R Markdown document converted from "./examples/book_translation/translate_latex_book.ipynb"
+output: html_document
+---
+
+# Translate a book writen in LaTeX from Slovenian into English
+
+With permission of the author, we will demonstrate how to translate the book [Euclidean Plane Geometry](https://sites.google.com/site/projektivna/), written by Milan Mitrović from Slovenian into English, without modifying any of the LaTeX commands.
+
+To achieve this, we will first split the book into chunks, each roughly a page long, then translate each chunk into English, and finally stitch them back together.
+
+## 1. Read in the data
+
+```{python}
+import openai
+from transformers import GPT2Tokenizer
+
+# OpenAI GPT-2 tokenizer is the same as GPT-3 tokenizer
+# we use it to count the number of tokens in the text
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+with open("data/geometry_slovenian.tex", "r") as f:
+    text = f.read()
+```
+
+### 1.1 Count the tokens in each chunk
+
+```{python}
+chunks = text.split('\n\n')
+ntokens = []
+for chunk in chunks:
+    ntokens.append(len(tokenizer.encode(chunk)))
+max(ntokens)
+```
+
+It turns out that a double newline is a good separator in this case, in order not to break the flow of the text. Also no individual chunk is larger than 1500 tokens. The model we will use is text-davinci-002, which has a limit of 4096 tokens, so we don't need to worry about breaking the chunks down further.
+
+We will group the shorter chunks into chunks of around 1000 tokens, to increase the coherence of the text, and decrease the frequency of breaks within the text.
+
+```{python}
+def group_chunks(chunks, ntokens, max_len=1000):
+    """
+    Group very short chunks, to form approximately a page long chunks.
+    """
+    batches = []
+    cur_batch = ""
+    cur_tokens = 0
+
+    # iterate over chunks, and group the short ones together
+    for chunk, ntoken in zip(chunks, ntokens):
+        cur_tokens += ntoken + 2  # +2 for the newlines between chunks
+
+        # if adding this chunk would exceed the max length, finalize the current batch and start a new one
+        if ntoken + cur_tokens > max_len:
+            batches.append(cur_batch)
+            cur_batch = chunk
+        else:
+            cur_batch += "\n\n" + chunk
+    batches.append(cur_batch)
+    return batches
+
+chunks = group_chunks(chunks, ntokens)
+len(chunks)
+```
+
+Notice that adding a sample untranslated and translated first command, where only the content of the chapter name needs to be translated, helps to get more consistent results.
+
+The format of the prompt sent to the model consists of:
+1. A high level instruction to translate only the text, but not commands into the desired language
+2. A sample untranslated command, where only the content of the chapter name needs to be translated
+3. The chunk of text to be translated
+4. The translated sample command from 2, which shows the model the beginning of the translation process
+
+The expected output is the translated chunk of text.
+
+```{python}
+def translate_chunk(chunk, engine='text-davinci-002',
+                    dest_language='English',
+                    sample_translation=("\poglavje{Osnove Geometrije} \label{osn9Geom}", "\poglavje{The basics of Geometry} \label{osn9Geom}")
+                    ):
+    prompt = f'''Translate only the text from the following LaTeX document into {dest_language}. Leave all LaTeX commands unchanged
+    
+"""
+{sample_translation[0]}
+{chunk}"""
+
+{sample_translation[1]}
+'''
+    response = openai.Completion.create(
+        prompt=prompt,
+        engine=engine,
+        temperature=0,
+        top_p=1,
+        max_tokens=1500,
+    )
+    result = response['choices'][0]['text'].strip()
+    result = result.replace('"""', '') # remove the double quotes, as we used them to surround the text
+    return result
+print(translate_chunk(chunks[800], engine='text-davinci-002', dest_language='English'))
+```
+
+We can see here that this one chunk in particular translates only the text, but leaves LaTeX commands intact.
+
+Let's now translate all the chunks in the book - this will take 2-3 hours, as we're processing requests sequentially.
+
+```{python}
+dest_language = "English"
+
+translated_chunks = []
+for i, chunk in enumerate(chunks):
+    print(str(i+1) + " / " + str(len(chunks)))
+    # translate each chunk
+    translated_chunks.append(translate_chunk(chunk, engine='text-davinci-002', dest_language=dest_language))
+
+# join the chunks together
+result = '\n\n'.join(translated_chunks)
+
+# save the final result
+with open(f"data/geometry_{dest_language}.tex", "w") as f:
+    f.write(result)
+```
+

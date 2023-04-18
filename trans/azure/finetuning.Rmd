@@ -1,0 +1,268 @@
+---
+title: An R Markdown document converted from "./examples/azure/finetuning.ipynb"
+output: html_document
+---
+
+# Azure Fine tuning example
+In this example we'll try to go over all operations that can be done using the Azure endpoints and their differences with the openAI endpoints (if any).<br>
+This example focuses on finetuning but also touches on the majority of operations that are available using the API. This example is meant to be a quick way of showing simple operations and is not meant as a finetune model adaptation tutorial.
+
+```{python}
+import openai
+from openai import cli
+```
+
+## Setup
+For the following sections to work properly we first have to setup some things. Let's start with the `api_base` and `api_version`. To find your `api_base` go to https://portal.azure.com, find your resource and then under "Resource Management" -> "Keys and Endpoints" look for the "Endpoint" value.
+
+```{python}
+openai.api_version = '2022-12-01'
+openai.api_base = '' # Please add your endpoint here
+```
+
+We next have to setup the `api_type` and `api_key`. We can either get the key from the portal or we can get it through Microsoft Active Directory Authentication. Depending on this the `api_type` is either `azure` or `azure_ad`.
+
+### Setup: Portal
+Let's first look at getting the key from the portal. Go to https://portal.azure.com, find your resource and then under "Resource Management" -> "Keys and Endpoints" look for one of the "Keys" values.
+
+```{python}
+openai.api_type = 'azure'
+openai.api_key = ''  # Please add your api key here
+```
+
+### (Optional) Setup: Microsoft Active Directory Authentication
+Let's now see how we can get a key via Microsoft Active Directory Authentication. Uncomment the following code if you want to use Active Directory Authentication instead of keys from the portal.
+
+```{python}
+# from azure.identity import DefaultAzureCredential
+
+# default_credential = DefaultAzureCredential()
+# token = default_credential.get_token("https://cognitiveservices.azure.com/.default")
+
+# openai.api_type = 'azure_ad'
+# openai.api_key = token.token
+```
+
+## Files
+In the next section we will focus on the files operations: importing, listing, retrieving, deleting. For this we need to create 2 temporary files with some sample data. For the sake of simplicity, we will use the same data for training and validation.
+
+```{python}
+import shutil
+import json
+
+training_file_name = 'training.jsonl'
+validation_file_name = 'validation.jsonl'
+
+sample_data = [{"prompt": "When I go to the store, I want an", "completion": "apple."},
+    {"prompt": "When I go to work, I want a", "completion": "coffee."},
+    {"prompt": "When I go home, I want a", "completion": "soda."}]
+
+print(f'Generating the training file: {training_file_name}')
+with open(training_file_name, 'w') as training_file:
+    for entry in sample_data:
+        json.dump(entry, training_file)
+        training_file.write('\n')
+
+print(f'Copying the training file to the validation file')
+shutil.copy(training_file_name, validation_file_name)
+```
+
+### Files: Listing
+List all of the uploaded files and check for the ones that are named "training.jsonl" or "validation.jsonl"
+
+```{python}
+print('Checking for existing uploaded files.')
+results = []
+files = openai.File.list().data
+print(f'Found {len(files)} total uploaded files in the subscription.')
+for item in files:
+    if item["filename"] in [training_file_name, validation_file_name]:
+        results.append(item["id"])
+print(f'Found {len(results)} already uploaded files that match our names.')
+```
+
+### Files: Deleting
+Let's now delete those found files (if any) since we're going to be re-uploading them next.
+
+```{python}
+print(f'Deleting already uploaded files...')
+for id in results:
+    openai.File.delete(sid = id)
+```
+
+### Files: Importing & Retrieving
+Now, let's import our two files ('training.jsonl' and 'validation.jsonl') and keep those IDs since we're going to use them later for finetuning.<br>
+For this operation we are going to use the cli wrapper which does a bit more checks before uploading and also gives us progress. In addition, after uploading we're going to check the status our import until it has succeeded (or failed if something goes wrong)
+
+```{python}
+import time
+
+def check_status(training_id, validation_id):
+    train_status = openai.File.retrieve(training_id)["status"]
+    valid_status = openai.File.retrieve(validation_id)["status"]
+    print(f'Status (training_file | validation_file): {train_status} | {valid_status}')
+    return (train_status, valid_status)
+
+#importing our two files
+training_id = cli.FineTune._get_or_upload(training_file_name, True)
+validation_id = cli.FineTune._get_or_upload(validation_file_name, True)
+
+#checking the status of the imports
+(train_status, valid_status) = check_status(training_id, validation_id)
+
+while train_status not in ["succeeded", "failed"] or valid_status not in ["succeeded", "failed"]:
+    time.sleep(1)
+    (train_status, valid_status) = check_status(training_id, validation_id)
+```
+
+### Files: Downloading
+Now let's download one of the files, the training file for example, to check that everything was in order during importing and all bits are there.
+
+```{python}
+print(f'Downloading training file: {training_id}')
+result = openai.File.download(training_id)
+print(result.decode('utf-8'))
+```
+
+## Finetune
+In this section we are going to use the two training and validation files that we imported in the previous section, to train a finetune model.
+
+### Finetune: Adapt
+First let's create the finetune adaptation job.
+
+```{python}
+create_args = {
+    "training_file": training_id,
+    "validation_file": validation_id,
+    "model": "babbage",
+    "compute_classification_metrics": True,
+    "classification_n_classes": 3,
+    "n_epochs": 20,
+    "batch_size": 3,
+    "learning_rate_multiplier": 0.3
+}
+resp = openai.FineTune.create(**create_args)
+job_id = resp["id"]
+status = resp["status"]
+
+print(f'Fine-tunning model with jobID: {job_id}.')
+```
+
+### Finetune: Streaming
+While the job runs, we can subscribe to the streaming events to check the progress of the operation.
+
+```{python}
+import signal
+import datetime
+
+def signal_handler(sig, frame):
+    status = openai.FineTune.retrieve(job_id).status
+    print(f"Stream interrupted. Job is still {status}.")
+    return
+
+print(f'Streaming events for the fine-tuning job: {job_id}')
+signal.signal(signal.SIGINT, signal_handler)
+
+events = openai.FineTune.stream_events(job_id)
+try:
+    for event in events:
+        print(f'{datetime.datetime.fromtimestamp(event["created_at"])} {event["message"]}')
+
+except Exception:
+    print("Stream interrupted (client disconnected).")
+```
+
+### Finetune: Listing and Retrieving
+Now let's check that our operation was successful and in addition we can look at all of the finetuning operations using a list operation.
+
+```{python}
+status = openai.FineTune.retrieve(id=job_id)["status"]
+if status not in ["succeeded", "failed"]:
+    print(f'Job not in terminal status: {status}. Waiting.')
+    while status not in ["succeeded", "failed"]:
+        time.sleep(2)
+        status = openai.FineTune.retrieve(id=job_id)["status"]
+        print(f'Status: {status}')
+else:
+    print(f'Finetune job {job_id} finished with status: {status}')
+
+print('Checking other finetune jobs in the subscription.')
+result = openai.FineTune.list()
+print(f'Found {len(result.data)} finetune jobs.')
+```
+
+### Finetune: Deleting
+Finally we can delete our finetune job.<br>
+WARNING: Please skip this step if you want to continue with the next section as the finetune model is needed. (The delete code is commented out by default)
+
+```{python}
+# openai.FineTune.delete(sid=job_id)
+```
+
+## Deployments
+In this section we are going to create a deployment using the finetune model that we just adapted and then used the deployment to create a simple completion operation.
+
+### Deployments: Create
+Let's create a deployment using the fine-tune model.
+
+```{python}
+#Fist let's get the model of the previous job:
+result = openai.FineTune.retrieve(id=job_id)
+if result["status"] == 'succeeded':
+    model = result["fine_tuned_model"]
+
+# Now let's create the deployment
+print(f'Creating a new deployment with model: {model}')
+result = openai.Deployment.create(model=model, scale_settings={"scale_type":"standard"})
+deployment_id = result["id"]
+```
+
+### Deployments: Retrieving
+Now let's check the status of the newly created deployment
+
+```{python}
+print(f'Checking for deployment status.')
+resp = openai.Deployment.retrieve(id=deployment_id)
+status = resp["status"]
+print(f'Deployment {deployment_id} is with status: {status}')
+```
+
+### Deployments: Listing
+Now because creating a new deployment takes a long time, let's look in the subscription for an already finished deployment that succeeded.
+
+```{python}
+print('While deployment running, selecting a completed one.')
+deployment_id = None
+result = openai.Deployment.list()
+for deployment in result.data:
+    if deployment["status"] == "succeeded":
+        deployment_id = deployment["id"]
+        break
+
+if not deployment_id:
+    print('No deployment with status: succeeded found.')
+else:
+    print(f'Found a successful deployment with id: {deployment_id}.')
+```
+
+### Completions
+Now let's send a sample completion to the deployment.
+
+```{python}
+print('Sending a test completion job')
+start_phrase = 'When I go home, I want a'
+response = openai.Completion.create(deployment_id=deployment_id, prompt=start_phrase, temperature=0, stop=".")
+text = response['choices'][0]['text'].replace('\n', '').replace(' .', '.').strip()
+print(f'"{start_phrase} {text}."')
+```
+
+### Deployments: Delete
+Finally let's delete the deployment
+
+```{python}
+print(f'Deleting deployment: {deployment_id}')
+openai.Deployment.delete(sid=deployment_id)
+```
+
+Thank you
+

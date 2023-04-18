@@ -1,0 +1,367 @@
+---
+title: An R Markdown document converted from "./examples/Multiclass_classification_for_transactions.ipynb"
+output: html_document
+---
+
+# Multiclass Classification for Transactions
+
+For this notebook we will be looking to classify a public dataset of transactions into a number of categories that we have predefined. These approaches should be replicable to any multiclass classification use case where we are trying to fit transactional data into predefined categories, and by the end of running through this you should have a few approaches for dealing with both labelled and unlabelled datasets.
+
+The different approaches we'll be taking in this notebook are:
+- **Zero-shot Classification:** First we'll do zero shot classification to put transactions in one of five named buckets using only a prompt for guidance
+- **Classification with Embeddings:** Following this we'll create embeddings on a labelled dataset, and then use a traditional classification model to test their effectiveness at identifying our categories
+- **Fine-tuned Classification:** Lastly we'll produce a fine-tuned model trained on our labelled dataset to see how this compares to the zero-shot and few-shot classification approaches
+
+## Setup
+
+```{python}
+%load_ext autoreload
+%autoreload 
+```
+
+```{python}
+import openai
+import pandas as pd
+import numpy as np
+import json
+import os
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+COMPLETIONS_MODEL = "text-davinci-002"
+```
+
+### Load dataset
+
+We're using a public transaction dataset of transactions over £25k for the Library of Scotland. The dataset has three features that we'll be using:
+- Supplier: The name of the supplier
+- Description: A text description of the transaction
+- Value: The value of the transaction in GBP
+
+**Source**:
+
+https://data.nls.uk/data/organisational-data/transactions-over-25k/
+
+```{python}
+transactions = pd.read_csv('./data/25000_spend_dataset_current.csv', encoding= 'unicode_escape')
+len(transactions)
+```
+
+```{python}
+transactions.head()
+```
+
+```{python}
+def request_completion(prompt):
+    
+    completion_response =   openai.Completion.create(
+                            prompt=prompt,
+                            temperature=0,
+                            max_tokens=5,
+                            top_p=1,
+                            frequency_penalty=0,
+                            presence_penalty=0,
+                            model=COMPLETIONS_MODEL
+                            )
+        
+    return completion_response
+
+def classify_transaction(transaction,prompt):
+    
+    prompt = prompt.replace('SUPPLIER_NAME',transaction['Supplier'])
+    prompt = prompt.replace('DESCRIPTION_TEXT',transaction['Description'])
+    prompt = prompt.replace('TRANSACTION_VALUE',str(transaction['Transaction value (£)']))
+    
+    classification = request_completion(prompt)['choices'][0]['text'].replace('\n','')
+    
+    return classification
+
+# This function takes your training and validation outputs from the prepare_data function of the Finetuning API, and
+# confirms that each have the same number of classes.
+# If they do not have the same number of classes the fine-tune will fail and return an error
+
+def check_finetune_classes(train_file,valid_file):
+
+    train_classes = set()
+    valid_classes = set()
+    with open(train_file, 'r') as json_file:
+        json_list = list(json_file)
+        print(len(json_list))
+
+    for json_str in json_list:
+        result = json.loads(json_str)
+        train_classes.add(result['completion'])
+        #print(f"result: {result['completion']}")
+        #print(isinstance(result, dict))
+
+    with open(valid_file, 'r') as json_file:
+        json_list = list(json_file)
+        print(len(json_list))
+
+    for json_str in json_list:
+        result = json.loads(json_str)
+        valid_classes.add(result['completion'])
+        #print(f"result: {result['completion']}")
+        #print(isinstance(result, dict))
+        
+    if len(train_classes) == len(valid_classes):
+        print('All good')
+        
+    else:
+        print('Classes do not match, please prepare data again')
+```
+
+## Zero-shot Classification
+
+We'll first assess the performance of the base models at classifying these transactions using a simple prompt. We'll provide the model with 5 categories and a catch-all of "Could not classify" for ones that it cannot place.
+
+```{python}
+zero_shot_prompt = '''You are a data expert working for the National Library of Scotland. 
+You are analysing all transactions over £25,000 in value and classifying them into one of five categories.
+The five categories are Building Improvement, Literature & Archive, Utility Bills, Professional Services and Software/IT.
+If you can't tell what it is, say Could not classify
+                      
+Transaction:
+                      
+Supplier: SUPPLIER_NAME
+Description: DESCRIPTION_TEXT
+Value: TRANSACTION_VALUE
+                      
+The classification is:'''
+```
+
+```{python}
+# Get a test transaction
+transaction = transactions.iloc[0]
+
+# Interpolate the values into the prompt
+prompt = zero_shot_prompt.replace('SUPPLIER_NAME',transaction['Supplier'])
+prompt = prompt.replace('DESCRIPTION_TEXT',transaction['Description'])
+prompt = prompt.replace('TRANSACTION_VALUE',str(transaction['Transaction value (£)']))
+
+# Use our completion function to return a prediction
+completion_response = request_completion(prompt)
+print(completion_response['choices'][0]['text'])
+```
+
+Our first attempt is correct, M & J Ballantyne Ltd are a house builder and the work they performed is indeed Building Improvement.
+
+Lets expand the sample size to 25 and see how it performs, again with just a simple prompt to guide it
+
+```{python}
+test_transactions = transactions.iloc[:25]
+test_transactions['Classification'] = test_transactions.apply(lambda x: classify_transaction(x,zero_shot_prompt),axis=1)
+```
+
+```{python}
+test_transactions['Classification'].value_counts()
+```
+
+```{python}
+test_transactions.head(25)
+```
+
+Initial results are pretty good even with no labelled examples! The ones that it could not classify were tougher cases with few clues as to their topic, but maybe if we clean up the labelled dataset to give more examples we can get better performance.
+
+## Classification with Embeddings
+
+Lets create embeddings from the small set that we've classified so far - we've made a set of labelled examples by running the zero-shot classifier on 101 transactions from our dataset and manually correcting the 15 **Could not classify** results that we got
+
+### Create embeddings
+
+This initial section reuses the approach from the [Obtain_dataset Notebook](Obtain_dataset.ipynb) to create embeddings from a combined field concatenating all of our features
+
+```{python}
+df = pd.read_csv('./data/labelled_transactions.csv')
+df.head()
+```
+
+```{python}
+df['combined'] = "Supplier: " + df['Supplier'].str.strip() + "; Description: " + df['Description'].str.strip() + "; Value: " + str(df['Transaction value (£)']).strip()
+df.head(2)
+```
+
+```{python}
+from transformers import GPT2TokenizerFast
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+df['n_tokens'] = df.combined.apply(lambda x: len(tokenizer.encode(x)))
+len(df)
+```
+
+```{python}
+embedding_path = './data/transactions_with_embeddings_100.csv'
+```
+
+```{python}
+from openai.embeddings_utils import get_embedding
+
+df['babbage_similarity'] = df.combined.apply(lambda x: get_embedding(x, engine='text-similarity-babbage-001'))
+df['babbage_search'] = df.combined.apply(lambda x: get_embedding(x, engine='text-search-babbage-doc-001'))
+df.to_csv(embedding_path)
+```
+
+### Use embeddings for classification
+
+Now that we have our embeddings, let see if classifying these into the categories we've named gives us any more success.
+
+For this we'll use a template from the [Classification_using_embeddings](Classification_using_embeddings.ipynb) notebook
+
+```{python}
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+
+fs_df = pd.read_csv(embedding_path)
+fs_df["babbage_similarity"] = fs_df.babbage_similarity.apply(eval).apply(np.array)
+fs_df.head()
+```
+
+```{python}
+X_train, X_test, y_train, y_test = train_test_split(
+    list(fs_df.babbage_similarity.values), fs_df.Classification, test_size=0.2, random_state=42
+)
+
+clf = RandomForestClassifier(n_estimators=100)
+clf.fit(X_train, y_train)
+preds = clf.predict(X_test)
+probas = clf.predict_proba(X_test)
+
+report = classification_report(y_test, preds)
+print(report)
+```
+
+Performance for this model is pretty strong, so creating embeddings and using even a simpler classifier looks like an effective approach as well, with the zero-shot classifier helping us do the initial classification of the unlabelled dataset.
+
+Lets take it one step further and see if a fine-tuned model trained on this same labelled datasets gives us comparable results
+
+## Fine-tuned Transaction Classification
+
+For this use case we're going to try to improve on the few-shot classification from above by training a fine-tuned model on the same labelled set of 101 transactions and applying this fine-tuned model on group of unseen transactions
+
+### Building Fine-tuned Classifier
+
+We'll need to do some data prep first to get our data ready. This will take the following steps:
+- First we'll list out our classes and replace them with numeric identifiers. Making the model predict a single token rather than multiple consecutive ones like 'Building Improvement' should give us better results
+- We also need to add a common prefix and suffix to each example to aid the model in making predictions - in our case our text is already started with 'Supplier' and we'll add a suffix of '\n\n###\n\n'
+- Lastly we'll aid a leading whitespace onto each of our target classes for classification, again to aid the model
+
+```{python}
+ft_prep_df = fs_df.copy()
+len(ft_prep_df)
+```
+
+```{python}
+ft_prep_df.head()
+```
+
+```{python}
+classes = list(set(ft_prep_df['Classification']))
+class_df = pd.DataFrame(classes).reset_index()
+class_df.columns = ['class_id','class']
+class_df  , len(class_df)
+```
+
+```{python}
+ft_df_with_class = ft_prep_df.merge(class_df,left_on='Classification',right_on='class',how='inner')
+
+# Adding a leading whitespace onto each completion to help the model
+ft_df_with_class['class_id'] = ft_df_with_class.apply(lambda x: ' ' + str(x['class_id']),axis=1)
+ft_df_with_class = ft_df_with_class.drop('class', axis=1)
+
+# Adding a common separator onto the end of each prompt so the model knows when a prompt is terminating
+ft_df_with_class['prompt'] = ft_df_with_class.apply(lambda x: x['combined'] + '\n\n###\n\n',axis=1)
+ft_df_with_class.head()
+```
+
+```{python}
+# This step is unnecessary if you have a number of observations in each class
+# In our case we don't, so we shuffle the data to give us a better chance of getting equal classes in our train and validation sets
+# Our fine-tuned model will error if we have less classes in the validation set, so this is a necessary step
+
+import random 
+
+labels = [x for x in ft_df_with_class['class_id']]
+text = [x for x in ft_df_with_class['prompt']]
+ft_df = pd.DataFrame(zip(text, labels), columns = ['prompt','class_id']) #[:300]
+ft_df.columns = ['prompt','completion']
+ft_df['ordering'] = ft_df.apply(lambda x: random.randint(0,len(ft_df)), axis = 1)
+ft_df.set_index('ordering',inplace=True)
+ft_df_sorted = ft_df.sort_index(ascending=True)
+ft_df_sorted.head()
+```
+
+```{python}
+# This step is to remove any existing files if we've already produced training/validation sets for this classifier
+#!rm transactions_grouped*
+
+# We output our shuffled dataframe to a .jsonl file and run the prepare_data function to get us our input files
+ft_df_sorted.to_json("transactions_grouped.jsonl", orient='records', lines=True)
+!openai tools fine_tunes.prepare_data -f transactions_grouped.jsonl -q
+```
+
+```{python}
+# This functions checks that your classes all appear in both prepared files
+# If they don't, the fine-tuned model creation will fail
+check_classes('transactions_grouped_prepared_train.jsonl','transactions_grouped_prepared_valid.jsonl')
+```
+
+```{python}
+# This step creates your model
+!openai api fine_tunes.create -t "transactions_grouped_prepared_train.jsonl" -v "transactions_grouped_prepared_valid.jsonl" --compute_classification_metrics --classification_n_classes 5 -m curie
+```
+
+```{python}
+# Congrats, you've got a fine-tuned model!
+# Copy/paste the name provided into the variable below and we'll take it for a spin
+fine_tuned_model = 'curie:ft-personal-2022-10-20-10-42-56'
+```
+
+### Applying Fine-tuned Classifier
+
+Now we'll apply our classifier to see how it performs. We only had 31 unique observations in our training set and 8 in our validation set, so lets see how the performance is
+
+```{python}
+test_set = pd.read_json('transactions_grouped_prepared_valid.jsonl', lines=True)
+test_set.head()
+```
+
+```{python}
+test_set['predicted_class'] = test_set.apply(lambda x: openai.Completion.create(model=fine_tuned_model, prompt=x['prompt'], max_tokens=1, temperature=0, logprobs=5),axis=1)
+test_set['pred'] = test_set.apply(lambda x : x['predicted_class']['choices'][0]['text'],axis=1)
+```
+
+```{python}
+test_set['result'] = test_set.apply(lambda x: str(x['pred']).strip() == str(x['completion']).strip(), axis = 1)
+```
+
+```{python}
+test_set['result'].value_counts()
+```
+
+Performance is not great - unfortunately this is expected. With only a few examples of each class, the above approach with embeddings and a traditional classifier worked better.
+
+A fine-tuned model works best with a great number of labelled observations. If we had a few hundred or thousand we may get better results, but lets do one last test on a holdout set to confirm that it doesn't generalise well to a new set of observations
+
+```{python}
+holdout_df = transactions.copy().iloc[101:]
+holdout_df.head()
+```
+
+```{python}
+holdout_df['combined'] = "Supplier: " + holdout_df['Supplier'].str.strip() + "; Description: " + holdout_df['Description'].str.strip() + '\n\n###\n\n' # + "; Value: " + str(df['Transaction value (£)']).strip()
+holdout_df['prediction_result'] = holdout_df.apply(lambda x: openai.Completion.create(model=fine_tuned_model, prompt=x['combined'], max_tokens=1, temperature=0, logprobs=5),axis=1)
+holdout_df['pred'] = holdout_df.apply(lambda x : x['prediction_result']['choices'][0]['text'],axis=1)
+```
+
+```{python}
+holdout_df.head(10)
+```
+
+```{python}
+holdout_df['pred'].value_counts()
+```
+
+Well those results were similarly underwhelming - so we've learned that with a dataset with a small number of labelled observations, either zero-shot classification or traditional classification with embeddings return better results than a fine-tuned model.
+
+A fine-tuned model is still a great tool, but is more effective when you have a larger number of labelled examples for each class that you're looking to classify
+

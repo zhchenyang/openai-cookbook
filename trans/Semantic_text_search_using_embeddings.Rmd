@@ -1,0 +1,68 @@
+---
+title: An R Markdown document converted from "./examples/Semantic_text_search_using_embeddings.ipynb"
+output: html_document
+---
+
+## Semantic text search using embeddings
+
+We can search through all our reviews semantically in a very efficient manner and at very low cost, by simply embedding our search query, and then finding the most similar reviews. The dataset is created in the [Obtain_dataset Notebook](Obtain_dataset.ipynb).
+
+```{python}
+import pandas as pd
+import numpy as np
+
+datafile_path = "data/fine_food_reviews_with_embeddings_1k.csv"
+
+df = pd.read_csv(datafile_path)
+df["embedding"] = df.embedding.apply(eval).apply(np.array)
+```
+
+Remember to use the documents embedding engine for documents (in this case reviews), and query embedding engine for queries. Note that here we just compare the cosine similarity of the embeddings of the query and the documents, and show top_n best matches.
+
+```{python}
+from openai.embeddings_utils import get_embedding, cosine_similarity
+
+# search through the reviews for a specific product
+def search_reviews(df, product_description, n=3, pprint=True):
+    product_embedding = get_embedding(
+        product_description,
+        engine="text-embedding-ada-002"
+    )
+    df["similarity"] = df.embedding.apply(lambda x: cosine_similarity(x, product_embedding))
+
+    results = (
+        df.sort_values("similarity", ascending=False)
+        .head(n)
+        .combined.str.replace("Title: ", "")
+        .str.replace("; Content:", ": ")
+    )
+    if pprint:
+        for r in results:
+            print(r[:200])
+            print()
+    return results
+
+
+results = search_reviews(df, "delicious beans", n=3)
+```
+
+```{python}
+results = search_reviews(df, "whole wheat pasta", n=3)
+```
+
+We can search through these reviews easily. To speed up computation, we can use a special algorithm, aimed at faster search through embeddings.
+
+```{python}
+results = search_reviews(df, "bad delivery", n=1)
+```
+
+As we can see, this can immediately deliver a lot of value. In this example we show being able to quickly find the examples of delivery failures.
+
+```{python}
+results = search_reviews(df, "spoilt", n=1)
+```
+
+```{python}
+results = search_reviews(df, "pet food", n=2)
+```
+
