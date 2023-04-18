@@ -1,0 +1,96 @@
+---
+title: An R Markdown document converted from "./examples/azure/completions.ipynb"
+output: html_document
+---
+
+# Azure completions example
+In this example we'll try to go over all operations needed to get completions working using the Azure endpoints. \
+This example focuses on completions but also touches on some other operations that are also available using the API. This example is meant to be a quick way of showing simple operations and is not meant as a tutorial.
+
+```{python}
+import openai
+```
+
+## Setup
+For the following sections to work properly we first have to setup some things. Let's start with the `api_base` and `api_version`. To find your `api_base` go to https://portal.azure.com, find your resource and then under "Resource Management" -> "Keys and Endpoints" look for the "Endpoint" value.
+
+```{python}
+openai.api_version = '2022-12-01'
+openai.api_base = '' # Please add your endpoint here
+```
+
+We next have to setup the `api_type` and `api_key`. We can either get the key from the portal or we can get it through Microsoft Active Directory Authentication. Depending on this the `api_type` is either `azure` or `azure_ad`.
+
+### Setup: Portal
+Let's first look at getting the key from the portal. Go to https://portal.azure.com, find your resource and then under "Resource Management" -> "Keys and Endpoints" look for one of the "Keys" values.
+
+```{python}
+openai.api_type = 'azure'
+openai.api_key = ''  # Please add your api key here
+```
+
+### (Optional) Setup: Microsoft Active Directory Authentication
+Let's now see how we can get a key via Microsoft Active Directory Authentication. Uncomment the following code if you want to use Active Directory Authentication instead of keys from the portal.
+
+```{python}
+# from azure.identity import DefaultAzureCredential
+
+# default_credential = DefaultAzureCredential()
+# token = default_credential.get_token("https://cognitiveservices.azure.com/.default")
+
+# openai.api_type = 'azure_ad'
+# openai.api_key = token.token
+```
+
+## Deployments
+In this section we are going to create a deployment using the `text-davinci-002` model that we can then use to create completions.
+
+### Deployments: Create manually
+Create a new deployment by going to your Resource in your portal under "Resource Management" -> "Model deployments". Select `text-davinci-002` as the model.
+
+### (Optional) Deployments: Create programatically
+We can also create a deployment using code:
+
+```{python}
+model = "text-davinci-002"
+
+# Now let's create the deployment
+print(f'Creating a new deployment with model: {model}')
+result = openai.Deployment.create(model=model, scale_settings={"scale_type":"standard"})
+deployment_id = result["id"]
+print(f'Successfully created deployment with id: {deployment_id}')
+```
+
+### (Optional) Deployments: Wait for deployment to succeed
+Now let's check the status of the newly created deployment and wait till it is succeeded.
+
+```{python}
+print(f'Checking for deployment status.')
+resp = openai.Deployment.retrieve(id=deployment_id)
+status = resp["status"]
+print(f'Deployment {deployment_id} has status: {status}')
+while status not in ["succeeded", "failed"]:
+    resp = openai.Deployment.retrieve(id=deployment_id)
+    status = resp["status"]
+    print(f'Deployment {deployment_id} has status: {status}')
+```
+
+### Completions
+Now let's send a sample completion to the deployment.
+
+```{python}
+prompt = "The food was delicious and the waiter"
+completion = openai.Completion.create(deployment_id=deployment_id,
+                                     prompt=prompt, stop=".", temperature=0)
+                                
+print(f"{prompt}{completion['choices'][0]['text']}.")
+```
+
+### (Optional) Deployments: Delete
+Finally let's delete the deployment
+
+```{python}
+print(f'Deleting deployment: {deployment_id}')
+openai.Deployment.delete(sid=deployment_id)
+```
+

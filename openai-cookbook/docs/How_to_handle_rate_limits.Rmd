@@ -1,0 +1,360 @@
+---
+title: An R Markdown document converted from "./examples/How_to_handle_rate_limits.ipynb"
+output: html_document
+---
+
+# How to handle rate limits
+
+When you call the OpenAI API repeatedly, you may encounter error messages that say `429: 'Too Many Requests'` or `RateLimitError`. These error messages come from exceeding the API's rate limits.
+
+This guide shares tips for avoiding and handling rate limit errors.
+
+To see an example script for throttling parallel requests to avoid rate limit errors, see [api_request_parallel_processor.py](api_request_parallel_processor.py).
+
+## Why rate limits exist
+
+Rate limits are a common practice for APIs, and they're put in place for a few different reasons.
+
+- First, they help protect against abuse or misuse of the API. For example, a malicious actor could flood the API with requests in an attempt to overload it or cause disruptions in service. By setting rate limits, OpenAI can prevent this kind of activity.
+- Second, rate limits help ensure that everyone has fair access to the API. If one person or organization makes an excessive number of requests, it could bog down the API for everyone else. By throttling the number of requests that a single user can make, OpenAI ensures that everyone has an opportunity to use the API without experiencing slowdowns.
+- Lastly, rate limits can help OpenAI manage the aggregate load on its infrastructure. If requests to the API increase dramatically, it could tax the servers and cause performance issues. By setting rate limits, OpenAI can help maintain a smooth and consistent experience for all users.
+
+Although hitting rate limits can be frustrating, rate limits exist to protect the reliable operation of the API for its users.
+
+## Default rate limits
+
+As of Jan 2023, the default rate limits are:
+
+<table>
+<thead>
+  <tr>
+    <th></th>
+    <th>Text Completion &amp; Embedding endpoints</th>
+    <th>Code &amp; Edit endpoints</th>
+  </tr>
+</thead>
+<tbody>
+  <tr>
+    <td>Free trial users</td>
+    <td>
+        <ul>
+            <li>20 requests / minute</li>
+            <li>150,000 tokens / minute</li>
+        </ul>
+    </td>
+    <td>
+        <ul>
+            <li>20 requests / minute</li>
+            <li>150,000 tokens / minute</li>
+        </ul>
+    </td>
+  </tr>
+  <tr>
+    <td>Pay-as-you-go users (in your first 48 hours)</td>
+    <td>
+        <ul>
+            <li>60 requests / minute</li>
+            <li>250,000 davinci tokens / minute (and proportionally more for cheaper models)</li>
+        </ul>
+    </td>
+    <td>
+        <ul>
+            <li>20 requests / minute</li>
+            <li>150,000 tokens / minute</li>
+        </ul>
+    </td>
+  </tr>
+  <tr>
+    <td>Pay-as-you-go users (after your first 48 hours)</td>
+    <td>
+        <ul>
+            <li>3,000 requests / minute</li>
+            <li>250,000 davinci tokens / minute (and proportionally more for cheaper models)</li>
+        </ul>
+    </td>
+    <td>
+        <ul>
+            <li>20 requests / minute</li>
+            <li>150,000 tokens / minute</li>
+        </ul>
+    </td>
+  </tr>
+</tbody>
+</table>
+
+For reference, 1,000 tokens is roughly a page of text.
+
+### Other rate limit resources
+
+Read more about OpenAI's rate limits in these other resources:
+
+- [Guide: Rate limits](https://beta.openai.com/docs/guides/rate-limits/overview)
+- [Help Center: Is API usage subject to any rate limits?](https://help.openai.com/en/articles/5955598-is-api-usage-subject-to-any-rate-limits)
+- [Help Center: How can I solve 429: 'Too Many Requests' errors?](https://help.openai.com/en/articles/5955604-how-can-i-solve-429-too-many-requests-errors)
+
+### Requesting a rate limit increase
+
+If you'd like your organization's rate limit increased, please fill out the following form:
+
+- [OpenAI Rate Limit Increase Request form](https://forms.gle/56ZrwXXoxAN1yt6i9)
+
+## Example rate limit error
+
+A rate limit error will occur when API requests are sent too quickly. If using the OpenAI Python library, they will look something like:
+
+```
+RateLimitError: Rate limit reached for default-codex in organization org-{id} on requests per min. Limit: 20.000000 / min. Current: 24.000000 / min. Contact support@openai.com if you continue to have issues or if you’d like to request an increase.
+```
+
+Below is example code for triggering a rate limit error.
+
+```{python}
+import openai  # for making OpenAI API requests
+
+# request a bunch of completions in a loop
+for _ in range(100):
+    openai.Completion.create(
+        model="code-cushman-001",
+        prompt="def magic_function():\n\t",
+        max_tokens=10,
+    )
+```
+
+## How to avoid rate limit errors
+
+### Retrying with exponential backoff
+
+One easy way to avoid rate limit errors is to automatically retry requests with a random exponential backoff. Retrying with exponential backoff means performing a short sleep when a rate limit error is hit, then retrying the unsuccessful request. If the request is still unsuccessful, the sleep length is increased and the process is repeated. This continues until the request is successful or until a maximum number of retries is reached.
+
+This approach has many benefits:
+
+- Automatic retries means you can recover from rate limit errors without crashes or missing data
+- Exponential backoff means that your first retries can be tried quickly, while still benefiting from longer delays if your first few retries fail
+- Adding random jitter to the delay helps retries from all hitting at the same time
+
+Note that unsuccessful requests contribute to your per-minute limit, so continuously resending a request won’t work.
+
+Below are a few example solutions.
+
+#### Example #1: Using the Tenacity library
+
+[Tenacity](https://tenacity.readthedocs.io/en/latest/) is an Apache 2.0 licensed general-purpose retrying library, written in Python, to simplify the task of adding retry behavior to just about anything.
+
+To add exponential backoff to your requests, you can use the `tenacity.retry` [decorator](https://peps.python.org/pep-0318/). The following example uses the `tenacity.wait_random_exponential` function to add random exponential backoff to a request.
+
+Note that the Tenacity library is a third-party tool, and OpenAI makes no guarantees about its reliability or security.
+
+```{python}
+import openai  # for OpenAI API calls
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_random_exponential,
+)  # for exponential backoff
+
+
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+def completion_with_backoff(**kwargs):
+    return openai.Completion.create(**kwargs)
+
+
+completion_with_backoff(model="text-davinci-002", prompt="Once upon a time,")
+```
+
+#### Example #2: Using the backoff library
+
+Another library that provides function decorators for backoff and retry is [backoff](https://pypi.org/project/backoff/).
+
+Like Tenacity, the backoff library is a third-party tool, and OpenAI makes no guarantees about its reliability or security.
+
+```{python}
+import backoff  # for exponential backoff
+import openai  # for OpenAI API calls
+
+
+@backoff.on_exception(backoff.expo, openai.error.RateLimitError)
+def completions_with_backoff(**kwargs):
+    return openai.Completion.create(**kwargs)
+
+
+completions_with_backoff(model="text-davinci-002", prompt="Once upon a time,")
+```
+
+#### Example 3: Manual backoff implementation
+
+If you don't want to use third-party libraries, you can implement your own backoff logic.
+
+```{python}
+# imports
+import random
+import time
+
+import openai
+
+# define a retry decorator
+def retry_with_exponential_backoff(
+    func,
+    initial_delay: float = 1,
+    exponential_base: float = 2,
+    jitter: bool = True,
+    max_retries: int = 10,
+    errors: tuple = (openai.error.RateLimitError,),
+):
+    """Retry a function with exponential backoff."""
+
+    def wrapper(*args, **kwargs):
+        # Initialize variables
+        num_retries = 0
+        delay = initial_delay
+
+        # Loop until a successful response or max_retries is hit or an exception is raised
+        while True:
+            try:
+                return func(*args, **kwargs)
+
+            # Retry on specified errors
+            except errors as e:
+                # Increment retries
+                num_retries += 1
+
+                # Check if max retries has been reached
+                if num_retries > max_retries:
+                    raise Exception(
+                        f"Maximum number of retries ({max_retries}) exceeded."
+                    )
+
+                # Increment the delay
+                delay *= exponential_base * (1 + jitter * random.random())
+
+                # Sleep for the delay
+                time.sleep(delay)
+
+            # Raise exceptions for any errors not specified
+            except Exception as e:
+                raise e
+
+    return wrapper
+
+
+@retry_with_exponential_backoff
+def completions_with_backoff(**kwargs):
+    return openai.Completion.create(**kwargs)
+
+
+completions_with_backoff(model="text-davinci-002", prompt="Once upon a time,")
+```
+
+## 如何在速率限制下最大化批处理吞吐量
+
+如果您正在处理用户的实时请求，则回退和重试是最小化延迟并避免速率限制错误的绝佳策略。
+
+但是，如果您正在处理大量批处理数据，吞吐量比延迟更重要，则除了回退和重试之外，还有其他几件事情可以做。
+
+### 主动在请求之间添加延迟
+
+如果您不断地达到速率限制，然后回退，然后再次达到速率限制，然后再次回退，则可能会有很大一部分请求预算“浪费”在需要重试的请求上。这限制了您的处理吞吐量，给定固定的速率限制。
+
+在这里，一个潜在的解决方案是计算您的速率限制，并添加等于其倒数的延迟（例如，如果您的速率限制为每分钟20个请求，则为每个请求添加3-6秒的延迟）。这可以帮助您在接近速率限制天花板而不会达到它并产生浪费请求的情况下运行。
+
+#### 添加请求延迟的示例
+
+```{python}
+# imports
+import time
+import openai
+
+# Define a function that adds a delay to a Completion API call
+def delayed_completion(delay_in_seconds: float = 1, **kwargs):
+    """Delay a completion by a specified amount of time."""
+
+    # Sleep for the delay
+    time.sleep(delay_in_seconds)
+
+    # Call the Completion API and return the result
+    return openai.Completion.create(**kwargs)
+
+
+# Calculate the delay based on your rate limit
+rate_limit_per_minute = 20
+delay = 60.0 / rate_limit_per_minute
+
+delayed_completion(
+    delay_in_seconds=delay,
+    model="text-davinci-002",
+    prompt="Once upon a time,"
+)
+```
+
+
+
+### 批量请求
+
+OpenAI API 对每分钟的请求和每分钟的令牌有单独的限制。
+
+如果您达到了每分钟的请求限制，但每分钟的令牌限制还有余地，则可以将多个任务批量处理到每个请求中。这将允许您处理更多的令牌每分钟，特别是对于较小的模型。
+
+发送一批提示与正常的 API 调用完全相同，只需将字符串列表传递到 `prompt` 参数中，而不是单个字符串。
+
+**警告：**响应对象可能不按提示的顺序返回完成，因此始终记得使用 `index` 字段将响应与提示匹配回来。
+
+#### 未使用批处理的示例
+
+```{python}
+import openai  # for making OpenAI API requests
+
+
+num_stories = 10
+prompt = "Once upon a time,"
+
+# serial example, with one story completion per request
+for _ in range(num_stories):
+    response = openai.Completion.create(
+        model="curie",
+        prompt=prompt,
+        max_tokens=20,
+    )
+
+    # print story
+    print(prompt + response.choices[0].text)
+```
+
+#### 批量处理的示例
+
+```{python}
+import openai  # for making OpenAI API requests
+
+
+num_stories = 10
+prompts = ["Once upon a time,"] * num_stories
+
+# batched example, with 10 stories completions per request
+response = openai.Completion.create(
+    model="curie",
+    prompt=prompts,
+    max_tokens=20,
+)
+
+# match completions to prompts by index
+stories = [""] * len(prompts)
+for choice in response.choices:
+    stories[choice.index] = prompts[choice.index] + choice.text
+
+# print stories
+for story in stories:
+    print(story)
+```
+
+## 并行处理示例脚本
+
+我们编写了一个用于并行处理大量 API 请求的示例脚本：[api_request_parallel_processor.py](api_request_parallel_processor.py)。
+
+该脚本结合了一些方便的功能：
+- 从文件流式传输请求，以避免在处理大型作业时耗尽内存
+- 并发进行请求，以最大化吞吐量
+- 限制请求和令牌使用，以保持在速率限制以下
+- 重试失败的请求，以避免丢失数据
+- 记录错误，以诊断请求问题
+
+请随意使用它或修改它以适应您的需求。
+
+
